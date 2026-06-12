@@ -106,6 +106,11 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # ── Temporal KV Cache (inference-only, no effect on training) ────────
+    use_temporal_kv_cache: bool = False
+    temporal_cache_sim_threshold: float = 0.98
+    temporal_cache_protect_attn_frac: float = 0.0
+
     def __post_init__(self):
         super().__post_init__()
 

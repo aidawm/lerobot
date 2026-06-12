@@ -28,6 +28,7 @@ if TYPE_CHECKING or _transformers_available:
         AutoProcessor,
         SmolVLMForConditionalGeneration,
     )
+    from .kv_cache import TemporalKVCache
 else:
     AutoConfig = None
     AutoModel = None
@@ -218,33 +219,75 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        temporal_kv_cache: "TemporalKVCache | None" = None,
+        static_mask: "torch.Tensor | None" = None,
     ) -> list[torch.Tensor]:
-        query_states = []
-        key_states = []
-        value_states = []
+        query_states_list = []
+        key_states_list = []
+        value_states_list = []
+ 
+        # Check if temporal cache is ready for this layer
+        cached = None
+        if (
+            temporal_kv_cache is not None
+            and temporal_kv_cache.is_ready()
+            and static_mask is not None
+        ):
+            cached = temporal_kv_cache.get_cached_kv(layer_idx)
+ 
         for i, hidden_states in enumerate(inputs_embeds):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
                 continue
+ 
             hidden_states = layer.input_layernorm(hidden_states)
-
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-
             hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+ 
+            # Q is always computed fresh
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            query_states_list.append(query_state)
+ 
+            # ── TEMPORAL CACHE PATH ──────────────────────────────────────────
+            if cached is not None:
+                cached_k, cached_v, _cached_smask, _static_idx = cached
+                B = hidden_states.shape[0]
+                H = layer.self_attn.head_dim
+ 
+                dynamic_idx = (~static_mask[0]).nonzero(as_tuple=True)[0]  # [N_dyn]
+ 
+                if len(dynamic_idx) > 0:
+                    dyn_hidden = hidden_states[:, dynamic_idx]
+                    n_heads_k = cached_k.shape[2]
+                    dyn_k = layer.self_attn.k_proj(dyn_hidden).view(B, len(dynamic_idx), n_heads_k, H)
+                    dyn_v = layer.self_attn.v_proj(dyn_hidden).view(B, len(dynamic_idx), n_heads_k, H)
+                else:
+                    dyn_k = cached_k.new_empty(B, 0, cached_k.shape[2], H)
+                    dyn_v = cached_v.new_empty(B, 0, cached_v.shape[2], H)
+ 
+                # Splice: start from cached full K/V, overwrite dynamic positions
+                full_k = cached_k.clone()
+                full_v = cached_v.clone()
+                if len(dynamic_idx) > 0:
+                    full_k[:, dynamic_idx] = dyn_k
+                    full_v[:, dynamic_idx] = dyn_v
+ 
+                key_states_list.append(full_k)
+                value_states_list.append(full_v)
+                continue  # skip standard path
+ 
+            # ── STANDARD PATH ────────────────────────────────────────────────
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
-
-            query_states.append(query_state)
-            key_states.append(key_state)
-            value_states.append(value_state)
-
-        # B,L,H,D with L sequence length, H number of heads, D head dim
-        # concatenate on the number of embeddings/tokens
-        query_states = torch.cat(query_states, dim=1)
-        key_states = torch.cat(key_states, dim=1)
-        value_states = torch.cat(value_states, dim=1)
+            key_states_list.append(key_state)
+            value_states_list.append(value_state)
+ 
+        # B,L,H,D — concatenate across streams
+        query_states = torch.cat(query_states_list, dim=1)
+        key_states = torch.cat(key_states_list, dim=1)
+        value_states = torch.cat(value_states_list, dim=1)
+ 
         seq_len = query_states.shape[1]
         if seq_len < position_ids.shape[1]:
             _position_ids = position_ids[:, :seq_len]
@@ -252,16 +295,21 @@ class SmolVLMWithExpertModel(nn.Module):
         else:
             _position_ids = position_ids
             _attention_mask = attention_mask
+ 
+        # Store raw K/V. RoPE is position-dependent and is applied below, so
+        # caching post-RoPE keys would rotate reused keys a second time.
+        if temporal_kv_cache is not None and static_mask is not None:
+            temporal_kv_cache.store_layer(
+                layer_idx, key_states.detach(), value_states.detach(), static_mask
+            )
 
-        attention_mask_ = _attention_mask
-        position_ids_ = _position_ids
-
-        query_states = apply_rope(query_states, position_ids_)
-        key_states = apply_rope(key_states, position_ids_)
-
+        query_states = apply_rope(query_states, _position_ids)
+        key_states = apply_rope(key_states, _position_ids)
+ 
+        # Intra-step cache (flow matching reuse) — unchanged
         if use_cache and past_key_values is None:
             past_key_values = {}
-
+ 
         if use_cache:
             if fill_kv_cache:
                 past_key_values[layer_idx] = {
@@ -275,13 +323,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 # in `transformers`. (molbap)
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
-
+ 
         attention_interface = self.get_attention_interface()
-
         att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+            _attention_mask, batch_size, head_dim, query_states, key_states, value_states
         )
         return [att_output], past_key_values
+
 
     def forward_cross_attn_layer(
         self,
@@ -420,6 +468,8 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        temporal_kv_cache: "TemporalKVCache | None" = None,
+        static_mask: "torch.Tensor | None" = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -451,6 +501,8 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    temporal_kv_cache=temporal_kv_cache,
+                    static_mask=static_mask,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(

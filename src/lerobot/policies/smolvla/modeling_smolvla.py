@@ -71,6 +71,7 @@ from ..utils import (
 )
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
+from .kv_cache import TemporalKVCache
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -245,7 +246,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.init_rtc_processor()
-        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self.model = VLAFlowMatching(config)
+ 
+        # Temporal KV cache — persists across select_action() calls within an episode.
+        # Off by default; enable via config.use_temporal_kv_cache = True at inference.
+        # Has NO effect during training.
+        self._temporal_kv_cache: TemporalKVCache | None = None
+        if getattr(config, "use_temporal_kv_cache", False):
+            self._temporal_kv_cache = TemporalKVCache(
+                sim_threshold=getattr(config, "temporal_cache_sim_threshold", 0.98),
+                warmup_steps=1,
+                protect_top_attn_frac=getattr(config, "temporal_cache_protect_attn_frac", 0.0),
+            )
+ 
         self.reset()
 
     def reset(self):
@@ -253,6 +266,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # Flush temporal KV cache so stale entries from the previous episode
+        # are not carried into the new one.
+        if hasattr(self, "_temporal_kv_cache") and self._temporal_kv_cache is not None:
+            self._temporal_kv_cache.clear()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -291,7 +308,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise,
+            temporal_kv_cache=self._temporal_kv_cache,
         )
 
         # Unpad actions
@@ -690,6 +709,10 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+        
+        # Track total visual token count for temporal KV cache
+        n_img_tokens = sum(e.shape[1] for e in embs)
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -726,7 +749,7 @@ class VLAFlowMatching(nn.Module):
 
         att_masks = att_masks.expand(bsize, -1)
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, n_img_tokens
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -784,7 +807,7 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -817,8 +840,8 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
-        **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
+        temporal_kv_cache=None,
+    )-> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
@@ -827,11 +850,25 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, n_img_tokens = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute static mask for temporal KV cache
+        static_mask = None
+        if temporal_kv_cache is not None:
+            # Visual tokens are first in prefix_embs, followed by text and state
+            vis_embeds = prefix_embs[:, :n_img_tokens, :]       # [B, N_vis, D]
+            n_text = lang_tokens.shape[1]
+            n_state = prefix_embs.shape[1] - n_img_tokens - n_text
+            static_mask = temporal_kv_cache.compute_static_mask(
+                curr_vis_embeds=vis_embeds,
+                n_text=n_text,
+                n_state=n_state,
+            )
+
         # Compute image and language key value cache
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
@@ -840,6 +877,8 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            temporal_kv_cache=temporal_kv_cache,
+            static_mask=static_mask,
         )
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
@@ -877,7 +916,10 @@ class VLAFlowMatching(nn.Module):
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
+        # Tick the cache step counter
+        if temporal_kv_cache is not None:
+            temporal_kv_cache.tick()
+            
         return x_t
 
     def denoise_step(
