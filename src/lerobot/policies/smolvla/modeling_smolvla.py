@@ -253,11 +253,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Has NO effect during training.
         self._temporal_kv_cache: TemporalKVCache | None = None
         if getattr(config, "use_temporal_kv_cache", False):
-            self._temporal_kv_cache = TemporalKVCache(
-                sim_threshold=getattr(config, "temporal_cache_sim_threshold", 0.98),
-                warmup_steps=1,
-                protect_top_attn_frac=getattr(config, "temporal_cache_protect_attn_frac", 0.0),
-            )
+            self._temporal_kv_cache = TemporalKVCache(warmup_steps=1)
  
         self.reset()
 
@@ -856,17 +852,17 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute static mask for temporal KV cache
+        # Compute static mask for temporal KV cache (language tokens only)
         static_mask = None
         if temporal_kv_cache is not None:
-            # Visual tokens are first in prefix_embs, followed by text and state
-            vis_embeds = prefix_embs[:, :n_img_tokens, :]       # [B, N_vis, D]
             n_text = lang_tokens.shape[1]
             n_state = prefix_embs.shape[1] - n_img_tokens - n_text
             static_mask = temporal_kv_cache.compute_static_mask(
-                curr_vis_embeds=vis_embeds,
+                n_vis=n_img_tokens,
                 n_text=n_text,
                 n_state=n_state,
+                batch_size=prefix_embs.shape[0],
+                device=prefix_embs.device,
             )
 
         # Compute image and language key value cache

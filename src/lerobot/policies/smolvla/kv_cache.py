@@ -15,17 +15,17 @@
 """
 Cross-timestep temporal KV cache for SmolVLA.
 
-Saves K/V projections for static visual and text tokens across robot control
-steps, so that only changed (dynamic) tokens are recomputed each step.
+Saves K/V projections for language tokens across robot control steps.
+Language tokens are exactly reusable: the instruction never changes within
+an episode, so their K/V projections are identical at every step.
 
 Key idea:
-    - Text tokens:   never change within an episode → always reuse
-    - Visual tokens: background patches don't move → reuse when cosine
-                     similarity to previous step exceeds `sim_threshold`
-    - State token:   changes every step → always recompute
+    - Text tokens:  never change within an episode → always reuse
+    - Visual tokens: may change → always recompute
+    - State token:  changes every step → always recompute
 
 Usage:
-    cache = TemporalKVCache(sim_threshold=0.98)
+    cache = TemporalKVCache()
 
     # inside your episode loop:
     policy.reset()              # clears cache at episode start
@@ -35,11 +35,10 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
@@ -53,42 +52,21 @@ class LayerKVEntry:
 
 class TemporalKVCache:
     """
-    Stores key/value tensors for static tokens across robot control timesteps.
+    Stores key/value tensors for language tokens across robot control timesteps.
 
     Token layout assumed (must match the order used in SmolVLMWithExpertModel.forward):
         [visual_tokens (N_vis) | text_tokens (N_text) | state_token (1)]
 
     Args:
-        sim_threshold: Cosine similarity above which a visual token is considered
-            static and its K/V can be reused. Default 0.98 is conservative; tune
-            down to ~0.95 for more aggressive caching.
         warmup_steps: Number of steps before the cache starts being used.
             Step 0 always does a full forward pass to populate the cache.
-        protect_top_attn_frac: Fraction of visual tokens with highest cross-attention
-            scores (from previous step) to force-recompute even if visually static.
-            Set to 0.0 to disable. Helps on fine-grained manipulation tasks.
     """
 
-    def __init__(
-        self,
-        sim_threshold: float = 0.98,
-        warmup_steps: int = 1,
-        protect_top_attn_frac: float = 0.0,
-    ):
-        self.sim_threshold = sim_threshold
+    def __init__(self, warmup_steps: int = 1):
         self.warmup_steps = warmup_steps
-        self.protect_top_attn_frac = protect_top_attn_frac
 
         # Per-layer cache: layer_idx -> LayerKVEntry
         self._layer_cache: dict[int, LayerKVEntry] = {}
-
-        # Visual embeddings from previous step (post-connector), used for sim check
-        # Shape: [B, N_vis, D]
-        self._prev_vis_embeds: Optional[torch.Tensor] = None
-
-        # Cross-attention scores from previous step (for task-relevance protection)
-        # Shape: [B, N_vis]
-        self._prev_attn_scores: Optional[torch.Tensor] = None
 
         # Internal step counter
         self._step: int = 0
@@ -103,8 +81,6 @@ class TemporalKVCache:
     def clear(self) -> None:
         """Must be called at every episode reset."""
         self._layer_cache.clear()
-        self._prev_vis_embeds = None
-        self._prev_attn_scores = None
         self._step = 0
         self.last_static_fraction = 0.0
 
@@ -122,60 +98,35 @@ class TemporalKVCache:
 
     def compute_static_mask(
         self,
-        curr_vis_embeds: torch.Tensor,  # [B, N_vis, D]
+        n_vis: int,
         n_text: int,
         n_state: int = 1,
+        batch_size: int = 1,
+        device: torch.device = None,
     ) -> torch.Tensor:
         """
         Compute a boolean mask [B, N_total] where True = token is static.
 
-        Saves curr_vis_embeds as prev for the next call — so call this exactly
-        once per control step, before the forward pass.
+        Only language tokens are marked static; visual and state tokens are
+        always recomputed.
 
         Args:
-            curr_vis_embeds: Post-connector visual token embeddings for this step.
-            n_text: Number of language tokens (constant within episode).
+            n_vis: Number of visual tokens.
+            n_text: Number of language tokens.
             n_state: Number of proprioceptive state tokens (default 1).
+            batch_size: Batch dimension B.
+            device: Target device for the mask tensor.
 
         Returns:
-            static_mask: [B, N_total] bool tensor on the same device as curr_vis_embeds.
+            static_mask: [B, N_total] bool tensor.
         """
-        B, N_vis, _ = curr_vis_embeds.shape
-        N_total = N_vis + n_text + n_state
-        device = curr_vis_embeds.device
+        N_total = n_vis + n_text + n_state
+        mask = torch.zeros(batch_size, N_total, dtype=torch.bool, device=device)
 
-        mask = torch.zeros(B, N_total, dtype=torch.bool, device=device)
+        # Only text tokens are static — instruction never changes within an episode
+        mask[:, n_vis : n_vis + n_text] = True
 
-        # --- Visual tokens: static iff cosine sim >= threshold ---
-        if self._prev_vis_embeds is not None:
-            prev = self._prev_vis_embeds.to(device=device, dtype=curr_vis_embeds.dtype)
-            # [B, N_vis]
-            sim = F.cosine_similarity(curr_vis_embeds, prev, dim=-1)
-            vis_static = sim >= self.sim_threshold
-
-            # Task-relevance protection: un-static highly attended tokens
-            if self.protect_top_attn_frac > 0.0 and self._prev_attn_scores is not None:
-                attn = self._prev_attn_scores.to(device=device)
-                k = max(1, int(self.protect_top_attn_frac * N_vis))
-                # top-k attended token indices per batch element
-                topk_idx = attn.topk(k, dim=-1).indices  # [B, k]
-                for b in range(B):
-                    vis_static[b, topk_idx[b]] = False
-
-            mask[:, :N_vis] = vis_static
-
-        # --- Text tokens: always static (instruction fixed within episode) ---
-        mask[:, N_vis : N_vis + n_text] = True
-
-        # --- State token(s): always dynamic (proprioception changes every step) ---
-        # mask[:, N_vis + n_text :] stays False
-
-        # Update prev embeddings for next step
-        self._prev_vis_embeds = curr_vis_embeds.detach().clone()
-
-        # Log diagnostic
         self.last_static_fraction = mask.float().mean().item()
-
         return mask  # [B, N_total]
 
     # ------------------------------------------------------------------
@@ -225,14 +176,6 @@ class TemporalKVCache:
             entry.static_idx,
         )
 
-    def update_attn_scores(self, attn_scores: torch.Tensor) -> None:
-        """
-        Optionally record cross-attention scores [B, N_vis] from the action expert
-        for task-relevance protection next step.
-        Call this after each forward pass if protect_top_attn_frac > 0.
-        """
-        self._prev_attn_scores = attn_scores.detach().clone()
-
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
@@ -243,5 +186,4 @@ class TemporalKVCache:
             "is_ready": self.is_ready(),
             "static_fraction": self.last_static_fraction,
             "cached_layers": len(self._layer_cache),
-            "sim_threshold": self.sim_threshold,
         }
